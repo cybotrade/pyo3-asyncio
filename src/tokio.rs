@@ -158,7 +158,7 @@ where
 /// This function first checks if the runtime has a task-local reference to the Python event loop.
 /// If not, it calls [`get_running_loop`](`crate::get_running_loop`) to get the event loop
 /// associated with the current OS thread.
-pub fn get_current_loop(py: Python) -> PyResult<&PyAny> {
+pub fn get_current_loop(py: Python) -> PyResult<Bound<PyAny>> {
     generic::get_current_loop::<TokioRuntime>(py)
 }
 
@@ -227,7 +227,7 @@ fn multi_thread() -> Builder {
 /// # Ok(())
 /// # }).unwrap();
 /// ```
-pub fn run_until_complete<F, T>(event_loop: &PyAny, fut: F) -> PyResult<T>
+pub fn run_until_complete<F, T>(event_loop: &Bound<PyAny>, fut: F) -> PyResult<T>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: Send + Sync + 'static,
@@ -312,7 +312,7 @@ where
 ///     )
 /// }
 /// ```
-pub fn future_into_py_with_locals<F, T>(py: Python, locals: TaskLocals, fut: F) -> PyResult<&PyAny>
+pub fn future_into_py_with_locals<F, T>(py: Python, locals: TaskLocals, fut: F) -> PyResult<Bound<PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: IntoPy<PyObject>,
@@ -358,7 +358,7 @@ where
 ///     })
 /// }
 /// ```
-pub fn future_into_py<F, T>(py: Python, fut: F) -> PyResult<&PyAny>
+pub fn future_into_py<F, T>(py: Python, fut: F) -> PyResult<Bound<PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: IntoPy<PyObject>,
@@ -449,7 +449,7 @@ pub fn local_future_into_py_with_locals<F, T>(
     py: Python,
     locals: TaskLocals,
     fut: F,
-) -> PyResult<&PyAny>
+) -> PyResult<Bound<PyAny>>
 where
     F: Future<Output = PyResult<T>> + 'static,
     T: IntoPy<PyObject>,
@@ -530,7 +530,7 @@ where
     note = "Questionable whether these conversions have real-world utility (see https://github.com/awestlake87/pyo3-asyncio/issues/59#issuecomment-1008038497 and let me know if you disagree!)"
 )]
 #[allow(deprecated)]
-pub fn local_future_into_py<F, T>(py: Python, fut: F) -> PyResult<&PyAny>
+pub fn local_future_into_py<F, T>(py: Python, fut: F) -> PyResult<Bound<PyAny>>
 where
     F: Future<Output = PyResult<T>> + 'static,
     T: IntoPy<PyObject>,
@@ -586,7 +586,7 @@ where
 ///     Ok(())
 /// }
 /// ```
-pub fn into_future(awaitable: &PyAny) -> PyResult<impl Future<Output = PyResult<PyObject>> + Send> {
+pub fn into_future(awaitable: Bound<PyAny>) -> PyResult<impl Future<Output = PyResult<PyObject>> + Send> {
     generic::into_future::<TokioRuntime>(awaitable)
 }
 

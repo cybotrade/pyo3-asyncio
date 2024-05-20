@@ -87,12 +87,12 @@ pub trait LocalContextExt: Runtime {
 /// This function first checks if the runtime has a task-local reference to the Python event loop.
 /// If not, it calls [`get_running_loop`](crate::get_running_loop`) to get the event loop associated
 /// with the current OS thread.
-pub fn get_current_loop<R>(py: Python) -> PyResult<&PyAny>
+pub fn get_current_loop<R>(py: Python) -> PyResult<Bound<PyAny>>
 where
     R: ContextExt,
 {
     if let Some(locals) = R::get_task_locals() {
-        Ok(locals.event_loop.into_ref(py))
+        Ok(locals.event_loop.into_bound(py))
     } else {
         get_running_loop(py)
     }
@@ -190,7 +190,7 @@ where
 /// # Ok(())
 /// # }).unwrap();
 /// ```
-pub fn run_until_complete<R, F, T>(event_loop: &PyAny, fut: F) -> PyResult<T>
+pub fn run_until_complete<R, F, T>(event_loop: &Bound<PyAny>, fut: F) -> PyResult<T>
 where
     R: Runtime + ContextExt,
     F: Future<Output = PyResult<T>> + Send + 'static,
@@ -201,7 +201,7 @@ where
     let result_rx = Arc::clone(&result_tx);
     let coro = future_into_py_with_locals::<R, _, ()>(
         py,
-        TaskLocals::new(event_loop).copy_context(py)?,
+        TaskLocals::new(event_loop.clone()).copy_context(py)?,
         async move {
             let val = fut.await?;
             if let Ok(mut result) = result_tx.lock() {
@@ -306,15 +306,15 @@ where
 {
     let event_loop = asyncio(py)?.call_method0("new_event_loop")?;
 
-    let result = run_until_complete::<R, F, T>(event_loop, fut);
+    let result = run_until_complete::<R, F, T>(&event_loop, fut);
 
     close(event_loop)?;
 
     result
 }
 
-fn cancelled(future: &PyAny) -> PyResult<bool> {
-    future.getattr("cancelled")?.call0()?.is_true()
+fn cancelled(future: Bound<PyAny>) -> PyResult<bool> {
+    future.getattr("cancelled")?.call0()?.is_truthy()
 }
 
 #[pyclass]
@@ -322,7 +322,7 @@ struct CheckedCompletor;
 
 #[pymethods]
 impl CheckedCompletor {
-    fn __call__(&self, future: &PyAny, complete: &PyAny, value: &PyAny) -> PyResult<()> {
+    fn __call__(&self, future: Bound<PyAny>, complete: &Bound<PyAny>, value: &Bound<PyAny>) -> PyResult<()> {
         if cancelled(future)? {
             return Ok(());
         }
@@ -333,15 +333,15 @@ impl CheckedCompletor {
     }
 }
 
-fn set_result(event_loop: &PyAny, future: &PyAny, result: PyResult<PyObject>) -> PyResult<()> {
+fn set_result(event_loop: &Bound<PyAny>, future: &Bound<PyAny>, result: PyResult<PyObject>) -> PyResult<()> {
     let py = event_loop.py();
-    let none = py.None().into_ref(py);
+    let none = py.None().into_bound(py);
 
     let (complete, val) = match result {
         Ok(val) => (future.getattr("set_result")?, val.into_py(py)),
         Err(err) => (future.getattr("set_exception")?, err.into_py(py)),
     };
-    call_soon_threadsafe(event_loop, none, (CheckedCompletor, future, complete, val))?;
+    call_soon_threadsafe(event_loop, &none, (CheckedCompletor, future, complete, val))?;
 
     Ok(())
 }
@@ -452,7 +452,7 @@ fn set_result(event_loop: &PyAny, future: &PyAny, result: PyResult<PyObject>) ->
 /// }
 /// ```
 pub fn into_future<R>(
-    awaitable: &PyAny,
+    awaitable: Bound<PyAny>,
 ) -> PyResult<impl Future<Output = PyResult<PyObject>> + Send>
 where
     R: Runtime + ContextExt,
@@ -567,7 +567,7 @@ pub fn future_into_py_with_locals<R, F, T>(
     py: Python,
     locals: TaskLocals,
     fut: F,
-) -> PyResult<&PyAny>
+) -> PyResult<Bound<PyAny>>
 where
     R: Runtime + ContextExt,
     F: Future<Output = PyResult<T>> + Send + 'static,
@@ -575,7 +575,7 @@ where
 {
     let (cancel_tx, cancel_rx) = oneshot::channel();
 
-    let py_fut = create_future(locals.event_loop.clone().into_ref(py))?;
+    let py_fut = create_future(locals.event_loop.clone().bind(py).clone())?;
     py_fut.call_method1(
         "add_done_callback",
         (PyDoneCallback {
@@ -583,7 +583,7 @@ where
         },),
     )?;
 
-    let future_tx1 = PyObject::from(py_fut);
+    let future_tx1 = PyObject::from(py_fut.clone());
     let future_tx2 = future_tx1.clone();
 
     R::spawn(async move {
@@ -597,7 +597,7 @@ where
             .await;
 
             Python::with_gil(move |py| {
-                if cancelled(future_tx1.as_ref(py))
+                if cancelled(future_tx1.clone().into_bound(py))
                     .map_err(dump_err(py))
                     .unwrap_or(false)
                 {
@@ -605,8 +605,8 @@ where
                 }
 
                 let _ = set_result(
-                    locals2.event_loop(py),
-                    future_tx1.as_ref(py),
+                    &locals2.event_loop(py),
+                    &future_tx1.bind(py),
                     result.map(|val| val.into_py(py)),
                 )
                 .map_err(dump_err(py));
@@ -616,7 +616,7 @@ where
         {
             if e.is_panic() {
                 Python::with_gil(move |py| {
-                    if cancelled(future_tx2.as_ref(py))
+                    if cancelled(future_tx2.clone().into_bound(py))
                         .map_err(dump_err(py))
                         .unwrap_or(false)
                     {
@@ -628,8 +628,8 @@ where
                         get_panic_message(&e.into_panic())
                     );
                     let _ = set_result(
-                        locals.event_loop.as_ref(py),
-                        future_tx2.as_ref(py),
+                        locals.event_loop.bind(py),
+                        &future_tx2.bind(py),
                         Err(RustPanic::new_err(panic_message)),
                     )
                     .map_err(dump_err(py));
@@ -721,7 +721,7 @@ struct PyDoneCallback {
 
 #[pymethods]
 impl PyDoneCallback {
-    pub fn __call__(&mut self, fut: &PyAny) -> PyResult<()> {
+    pub fn __call__(&mut self, fut: Bound<PyAny>) -> PyResult<()> {
         let py = fut.py();
 
         if cancelled(fut).map_err(dump_err(py)).unwrap_or(false) {
@@ -830,7 +830,7 @@ impl PyDoneCallback {
 ///     })
 /// }
 /// ```
-pub fn future_into_py<R, F, T>(py: Python, fut: F) -> PyResult<&PyAny>
+pub fn future_into_py<R, F, T>(py: Python, fut: F) -> PyResult<Bound<PyAny>>
 where
     R: Runtime + ContextExt,
     F: Future<Output = PyResult<T>> + Send + 'static,
@@ -971,7 +971,7 @@ pub fn local_future_into_py_with_locals<R, F, T>(
     py: Python,
     locals: TaskLocals,
     fut: F,
-) -> PyResult<&PyAny>
+) -> PyResult<Bound<PyAny>>
 where
     R: Runtime + SpawnLocalExt + LocalContextExt,
     F: Future<Output = PyResult<T>> + 'static,
@@ -979,7 +979,7 @@ where
 {
     let (cancel_tx, cancel_rx) = oneshot::channel();
 
-    let py_fut = create_future(locals.event_loop.clone().into_ref(py))?;
+    let py_fut = create_future(locals.event_loop.clone().bind(py).clone())?;
     py_fut.call_method1(
         "add_done_callback",
         (PyDoneCallback {
@@ -987,7 +987,7 @@ where
         },),
     )?;
 
-    let future_tx1 = PyObject::from(py_fut);
+    let future_tx1 = PyObject::from(py_fut.clone());
     let future_tx2 = future_tx1.clone();
 
     R::spawn_local(async move {
@@ -1001,7 +1001,7 @@ where
             .await;
 
             Python::with_gil(move |py| {
-                if cancelled(future_tx1.as_ref(py))
+                if cancelled(future_tx1.bind(py).clone())
                     .map_err(dump_err(py))
                     .unwrap_or(false)
                 {
@@ -1009,8 +1009,8 @@ where
                 }
 
                 let _ = set_result(
-                    locals2.event_loop.as_ref(py),
-                    future_tx1.as_ref(py),
+                    locals2.event_loop.bind(py),
+                    future_tx1.bind(py).as_ref(),
                     result.map(|val| val.into_py(py)),
                 )
                 .map_err(dump_err(py));
@@ -1020,7 +1020,7 @@ where
         {
             if e.is_panic() {
                 Python::with_gil(move |py| {
-                    if cancelled(future_tx2.as_ref(py))
+                    if cancelled(future_tx2.bind(py).clone())
                         .map_err(dump_err(py))
                         .unwrap_or(false)
                     {
@@ -1032,8 +1032,8 @@ where
                         get_panic_message(&e.into_panic())
                     );
                     let _ = set_result(
-                        locals.event_loop.as_ref(py),
-                        future_tx2.as_ref(py),
+                        locals.event_loop.bind(py),
+                        future_tx2.bind(py),
                         Err(RustPanic::new_err(panic_message)),
                     )
                     .map_err(dump_err(py));
@@ -1168,7 +1168,7 @@ where
     note = "Questionable whether these conversions have real-world utility (see https://github.com/awestlake87/pyo3-asyncio/issues/59#issuecomment-1008038497 and let me know if you disagree!)"
 )]
 #[allow(deprecated)]
-pub fn local_future_into_py<R, F, T>(py: Python, fut: F) -> PyResult<&PyAny>
+pub fn local_future_into_py<R, F, T>(py: Python, fut: F) -> PyResult<Bound<PyAny>>
 where
     R: Runtime + ContextExt + SpawnLocalExt + LocalContextExt,
     F: Future<Output = PyResult<T>> + 'static,
